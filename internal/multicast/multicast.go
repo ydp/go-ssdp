@@ -1,14 +1,17 @@
 package multicast
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/koron/go-ssdp/internal/ssdplog"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // Conn is multicast connection.
@@ -19,6 +22,27 @@ type Conn struct {
 	iflist []net.Interface
 }
 
+func Control(network, address string, c syscall.RawConn) (err error) {
+	return c.Control(func(fd uintptr) {
+		err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		if err != nil {
+			return
+		}
+		err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		if err != nil {
+			return
+		}
+		ifList, err := interfaces()
+		if err != nil || len(ifList) != 1 {
+			return
+		}
+		err = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, ifList[0].Name)
+		if err != nil {
+			return
+		}
+	})
+}
+
 // Listen starts to receiving multicast messages.
 func Listen(r *AddrResolver) (*Conn, error) {
 	// prepare parameters.
@@ -26,11 +50,23 @@ func Listen(r *AddrResolver) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Set Control function
+	listenConfig := net.ListenConfig{
+		Control: Control,
+	}
+
 	// connect.
-	conn, err := net.ListenUDP("udp4", laddr)
+	packConn, err := listenConfig.ListenPacket(context.Background(), "udp4", laddr.String())
 	if err != nil {
 		return nil, err
 	}
+	conn := packConn.(*net.UDPConn)
+	err = ipv4.NewPacketConn(conn).SetControlMessage(ipv4.FlagTTL|ipv4.FlagSrc|ipv4.FlagDst|ipv4.FlagInterface, true)
+	if err != nil {
+		return nil, err
+	}
+
 	// configure socket to use with multicast.
 	pconn, iflist, err := newIPv4MulticastConn(conn)
 	if err != nil {
